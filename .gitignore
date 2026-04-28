@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.cache/
+hf_cache/
+data/
+checkpoints/
+runs/
+wandb/
+*.wav
+*.flac
+*.parquet
+.DS_Store
