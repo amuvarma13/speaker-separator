@@ -11,6 +11,9 @@ runs/
 wandb/
 download.log
 *.log
+data_internalcan/
+data_internalcan_full/
+smoke.log
 *.wav
 *.flac
 *.parquet

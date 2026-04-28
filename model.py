@@ -1,44 +1,42 @@
 import torch
 import torch.nn as nn
 from transformers import Qwen3ForCausalLM, Wav2Vec2Model, Wav2Vec2Config
-from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 
 class SpeakerSeparator(Qwen3ForCausalLM):
-    config_class = Qwen3Config
-
     def __init__(self, config, w2v_name="facebook/wav2vec2-base", down=4):
         super().__init__(config)
         self.down = down
-        self.w2v = Wav2Vec2Model(Wav2Vec2Config.from_pretrained(w2v_name))
-        d_in = self.w2v.config.hidden_size * down
-        d_h = config.hidden_size
+        w2v_cfg = Wav2Vec2Config.from_pretrained(w2v_name)
+        w2v_cfg.gradient_checkpointing = False
+        self.w2v = Wav2Vec2Model(w2v_cfg)
         self.proj = nn.Sequential(
-            nn.Linear(d_in, d_h),
+            nn.Linear(w2v_cfg.hidden_size * down, config.hidden_size),
             nn.GELU(),
-            nn.Linear(d_h, d_h),
+            nn.Linear(config.hidden_size, config.hidden_size),
         )
 
-    def encode_audio(self, audio, mask=None):
-        h = self.w2v(audio, attention_mask=mask).last_hidden_state
+    def encode_audio(self, audio):
+        h = self.w2v(audio).last_hidden_state
         b, t, d = h.shape
         t2 = (t // self.down) * self.down
-        h = h[:, :t2].reshape(b, t2 // self.down, d * self.down)
-        return self.proj(h)
+        return self.proj(h[:, :t2].reshape(b, t2 // self.down, d * self.down))
 
-    def forward(self, audio=None, audio_mask=None, input_ids=None, attention_mask=None, labels=None):
-        a = self.encode_audio(audio, audio_mask)
-        t = self.get_input_embeddings()(input_ids)
-        embeds = torch.cat([a, t], dim=1)
-        b, ta, _ = a.shape
-        am = torch.ones(b, ta, device=a.device, dtype=attention_mask.dtype)
-        attn = torch.cat([am, attention_mask], dim=1)
-        if labels is not None:
-            pad = torch.full((b, ta), -100, device=a.device, dtype=labels.dtype)
-            labels = torch.cat([pad, labels], dim=1)
+    def forward(self, audio, input_ids, latent_mask, labels=None, attention_mask=None):
+        a = self.encode_audio(audio)
+        embeds = self.get_input_embeddings()(input_ids)
+        flat = []
+        for b in range(embeds.size(0)):
+            n = int(latent_mask[b].sum())
+            if a.size(1) >= n:
+                flat.append(a[b, :n])
+            else:
+                flat.append(torch.cat([a[b], a.new_zeros(n - a.size(1), a.size(2))], 0))
+        flat = torch.cat(flat, 0).to(embeds.dtype)
+        embeds = embeds.masked_scatter(latent_mask.unsqueeze(-1), flat)
         return super().forward(
             inputs_embeds=embeds,
-            attention_mask=attn,
+            attention_mask=attention_mask,
             labels=labels,
             use_cache=False,
         )

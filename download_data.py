@@ -1,17 +1,21 @@
 import os
-from huggingface_hub import hf_hub_download
+from huggingface_hub import snapshot_download
 
-REPO = "parler-tts/mls_eng_10k"
-NUM_SHARDS = int(os.environ.get("NUM_SHARDS", "7"))
-OUT = os.environ.get("DATA_DIR", "./data")
+REPO = os.environ.get("REPO", "InternalCan/10k_hrs_audio_with_tokens_small_example_ds")
+OUT = os.environ.get("DATA_DIR", "./data_internalcan")
+WORKERS = int(os.environ.get("WORKERS", "16"))
 
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    for i in range(NUM_SHARDS):
-        name = f"data/train-{i:05d}-of-00317.parquet"
-        p = hf_hub_download(repo_id=REPO, filename=name, repo_type="dataset", local_dir=OUT)
-        print(p)
+    snapshot_download(
+        repo_id=REPO,
+        repo_type="dataset",
+        local_dir=OUT,
+        max_workers=WORKERS,
+        allow_patterns=["data/*.parquet", "README.md"],
+    )
+    print("done", OUT)
 
 
 if __name__ == "__main__":

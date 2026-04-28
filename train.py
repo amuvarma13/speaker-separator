@@ -1,112 +1,116 @@
 import os
-import io
 import torch
 import numpy as np
-import soundfile as sf
-from torch.utils.data import DataLoader, IterableDataset
-from accelerate import Accelerator
-from accelerate.utils import set_seed
-from datasets import load_dataset
-from datasets.distributed import split_dataset_by_node
-from transformers import AutoTokenizer, Wav2Vec2Model, get_cosine_schedule_with_warmup
+from datasets import load_dataset, Audio
+from transformers import AutoTokenizer, Trainer, TrainingArguments, Wav2Vec2Model
 
 from model import SpeakerSeparator
 
 
+SR = 16000
 LLM_NAME = os.environ.get("LLM_NAME", "Qwen/Qwen3-4B")
 W2V_NAME = os.environ.get("W2V_NAME", "facebook/wav2vec2-base")
-DATA_DIR = os.environ.get("DATA_DIR", "./data")
-SR = 16000
-MAX_AUDIO_S = float(os.environ.get("MAX_AUDIO_S", "12"))
-MAX_TEXT_TOKENS = int(os.environ.get("MAX_TEXT_TOKENS", "256"))
+DATA_DIR = os.environ.get("DATA_DIR", "./data_internalcan")
+DELAY = int(os.environ.get("DELAY", "0"))
 BSZ = int(os.environ.get("BSZ", "1"))
-GRAD_ACCUM = int(os.environ.get("GRAD_ACCUM", "8"))
-LR = float(os.environ.get("LR", "1e-4"))
+GA = int(os.environ.get("GA", "8"))
+LR = float(os.environ.get("LR", "5e-5"))
+MAX_STEPS = int(os.environ.get("MAX_STEPS", "5000"))
 WARMUP = int(os.environ.get("WARMUP", "100"))
 SEED = int(os.environ.get("SEED", "0"))
-MAX_STEPS = int(os.environ.get("MAX_STEPS", "5000"))
-OUT_DIR = os.environ.get("OUT_DIR", "./checkpoints")
-LOG_EVERY = int(os.environ.get("LOG_EVERY", "10"))
+MAX_AUDIO_S = float(os.environ.get("MAX_AUDIO_S", "12"))
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "2"))
+LIMIT = int(os.environ.get("LIMIT", "0"))
+
+TOK_LEN = 151936
+START_SPEECH = TOK_LEN + 1
+END_SPEECH = TOK_LEN + 2
+START_HUMAN = TOK_LEN + 3
+END_HUMAN = TOK_LEN + 4
+START_AI = TOK_LEN + 5
+END_AI = TOK_LEN + 6
+PAD = TOK_LEN + 7
+START_TEXT = TOK_LEN + 10
+END_TEXT = TOK_LEN + 11
+AUDIO_START = TOK_LEN + 12
+
+CB = ["semantic_codes", "cb_0", "cb_1", "cb_2", "cb_3", "cb_4", "cb_5", "cb_6"]
+OFFS = [0, 16384, 16384 + 4096, 16384 + 2*4096, 16384 + 3*4096, 16384 + 4*4096, 16384 + 5*4096, 16384 + 6*4096]
+NEW_VOCAB = AUDIO_START + 16384 + 7 * 4096
 
 
 def shards():
     d = os.path.join(DATA_DIR, "data")
-    return sorted(os.path.join(d, f) for f in os.listdir(d) if f.startswith("train-") and f.endswith(".parquet"))
+    return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".parquet"))
 
 
-def decode(row, tok):
-    a = row["audio"]
-    if isinstance(a, dict) and "bytes" in a and a["bytes"] is not None:
-        wav, sr = sf.read(io.BytesIO(a["bytes"]), dtype="float32")
-    else:
-        wav = np.asarray(a["array"], dtype=np.float32)
-        sr = a["sampling_rate"]
-    if wav.ndim > 1:
-        wav = wav.mean(-1)
-    if sr != SR:
-        import librosa
-        wav = librosa.resample(wav, orig_sr=sr, target_sr=SR).astype(np.float32)
-    n = int(MAX_AUDIO_S * SR)
-    if wav.shape[0] > n:
-        wav = wav[:n]
-    ids = tok(row["transcript"], add_special_tokens=False, truncation=True, max_length=MAX_TEXT_TOKENS - 1).input_ids + [tok.eos_token_id]
-    return wav, ids
-
-
-class Stream(IterableDataset):
-    def __init__(self, tok, rank, world):
+class Collator:
+    def __init__(self, tok, delay):
         self.tok = tok
-        self.rank = rank
-        self.world = world
+        self.delay = delay
 
-    def __iter__(self):
-        ds = load_dataset("parquet", data_files=shards(), split="train", streaming=True)
-        ds = split_dataset_by_node(ds, rank=self.rank, world_size=self.world)
-        ds = ds.shuffle(seed=SEED + self.rank, buffer_size=512)
-        for row in ds:
-            if row.get("audio_duration") and row["audio_duration"] > MAX_AUDIO_S:
-                continue
-            try:
-                wav, ids = decode(row, self.tok)
-            except Exception:
-                continue
-            if wav.shape[0] < SR // 2 or len(ids) < 2:
-                continue
-            yield wav, ids
-
-
-def collate(batch, pad_id):
-    wavs, ids = zip(*batch)
-    aT = max(w.shape[0] for w in wavs)
-    audio = np.zeros((len(batch), aT), dtype=np.float32)
-    amask = np.zeros((len(batch), aT), dtype=np.int64)
-    for i, w in enumerate(wavs):
-        audio[i, :w.shape[0]] = w
-        amask[i, :w.shape[0]] = 1
-    tT = max(len(x) for x in ids)
-    input_ids = np.full((len(batch), tT), pad_id, dtype=np.int64)
-    tmask = np.zeros((len(batch), tT), dtype=np.int64)
-    labels = np.full((len(batch), tT), -100, dtype=np.int64)
-    for i, x in enumerate(ids):
-        input_ids[i, :len(x)] = x
-        tmask[i, :len(x)] = 1
-        labels[i, :len(x)] = x
-    return {
-        "audio": torch.from_numpy(audio),
-        "audio_mask": torch.from_numpy(amask),
-        "input_ids": torch.from_numpy(input_ids),
-        "attention_mask": torch.from_numpy(tmask),
-        "labels": torch.from_numpy(labels),
-    }
+    def __call__(self, batch):
+        audios, idses, masks, labelses = [], [], [], []
+        for r in batch:
+            wav = np.asarray(r["audio"]["array"], dtype=np.float32)
+            n_max = int(MAX_AUDIO_S * SR)
+            if wav.shape[0] > n_max:
+                wav = wav[:n_max]
+            n_w2v = (wav.shape[0] // 320) // 4
+            n_codes = min(len(r["semantic_codes"]), n_w2v)
+            text_ids = self.tok.encode(r["text"], add_special_tokens=False)
+            prefix = [START_HUMAN, START_TEXT, *text_ids, END_TEXT, END_HUMAN, START_AI, START_SPEECH]
+            seq = list(prefix)
+            mask = [False] * len(prefix)
+            for t in range(n_codes + self.delay):
+                if 0 <= t < n_codes:
+                    seq.append(PAD)
+                    mask.append(True)
+                ct = t - self.delay
+                if 0 <= ct < n_codes:
+                    for i, name in enumerate(CB):
+                        c = r[name][ct]
+                        if c == -1:
+                            continue
+                        seq.append(c + OFFS[i] + AUDIO_START)
+                        mask.append(False)
+            seq.extend([END_SPEECH, END_AI])
+            mask.extend([False, False])
+            lbl = [-100 if m else s for s, m in zip(seq, mask)]
+            audios.append(wav)
+            idses.append(seq)
+            masks.append(mask)
+            labelses.append(lbl)
+        aT = max(w.shape[0] for w in audios)
+        audio = np.zeros((len(batch), aT), dtype=np.float32)
+        for i, w in enumerate(audios):
+            audio[i, :w.shape[0]] = w
+        L = max(len(s) for s in idses)
+        ids = np.full((len(batch), L), PAD, dtype=np.int64)
+        am = np.zeros((len(batch), L), dtype=np.int64)
+        m = np.zeros((len(batch), L), dtype=bool)
+        labs = np.full((len(batch), L), -100, dtype=np.int64)
+        for i in range(len(batch)):
+            ids[i, :len(idses[i])] = idses[i]
+            am[i, :len(idses[i])] = 1
+            m[i, :len(masks[i])] = masks[i]
+            labs[i, :len(labelses[i])] = labelses[i]
+        return {
+            "audio": torch.from_numpy(audio).to(torch.bfloat16),
+            "input_ids": torch.from_numpy(ids),
+            "attention_mask": torch.from_numpy(am),
+            "latent_mask": torch.from_numpy(m),
+            "labels": torch.from_numpy(labs),
+        }
 
 
 def main():
-    set_seed(SEED)
-    acc = Accelerator(gradient_accumulation_steps=GRAD_ACCUM, mixed_precision="bf16")
     tok = AutoTokenizer.from_pretrained(LLM_NAME)
-    if tok.pad_token_id is None:
-        tok.pad_token = tok.eos_token
+
+    ds = load_dataset("parquet", data_files=shards(), split="train")
+    if LIMIT > 0:
+        ds = ds.select(range(min(LIMIT, len(ds))))
+    ds = ds.cast_column("audio", Audio(sampling_rate=SR))
 
     model = SpeakerSeparator.from_pretrained(
         LLM_NAME,
@@ -117,60 +121,36 @@ def main():
     w2v_pre = Wav2Vec2Model.from_pretrained(W2V_NAME, torch_dtype=torch.bfloat16)
     model.w2v.load_state_dict(w2v_pre.state_dict())
     del w2v_pre
-    model.gradient_checkpointing_enable()
+    model.resize_token_embeddings(NEW_VOCAB)
 
-    ds = Stream(tok, acc.process_index, acc.num_processes)
-    loader = DataLoader(ds, batch_size=BSZ, num_workers=NUM_WORKERS, collate_fn=lambda b: collate(b, tok.pad_token_id))
+    run = f"d{DELAY}_bs{BSZ}x{GA}_lr{LR:.0e}_{LLM_NAME.split('/')[-1]}"
+    args = TrainingArguments(
+        output_dir=f"./checkpoints/{run}",
+        per_device_train_batch_size=BSZ,
+        gradient_accumulation_steps=GA,
+        learning_rate=LR,
+        max_steps=MAX_STEPS,
+        warmup_steps=WARMUP,
+        logging_steps=1,
+        save_steps=1000,
+        save_total_limit=2,
+        bf16=True,
+        dataloader_num_workers=NUM_WORKERS,
+        remove_unused_columns=False,
+        report_to="wandb",
+        run_name=run,
+        seed=SEED,
+        ddp_find_unused_parameters=False,
+    )
 
-    nd = ("bias", "layer_norm.weight", "norm.weight", "LayerNorm.weight")
-    params = [
-        {"params": [p for n, p in model.named_parameters() if p.requires_grad and not any(k in n for k in nd)], "weight_decay": 0.01},
-        {"params": [p for n, p in model.named_parameters() if p.requires_grad and any(k in n for k in nd)], "weight_decay": 0.0},
-    ]
-    opt = torch.optim.AdamW(params, lr=LR, betas=(0.9, 0.95))
-    sch = get_cosine_schedule_with_warmup(opt, WARMUP, MAX_STEPS)
-
-    model, opt, loader, sch = acc.prepare(model, opt, loader, sch)
-    model.train()
-
-    step = 0
-    micro = 0
-    running = 0.0
-    while step < MAX_STEPS:
-        for batch in loader:
-            with acc.accumulate(model):
-                out = model(
-                    audio=batch["audio"].to(torch.bfloat16),
-                    audio_mask=batch["audio_mask"],
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                )
-                acc.backward(out.loss)
-                if acc.sync_gradients:
-                    acc.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-                sch.step()
-                opt.zero_grad()
-            running += out.loss.detach().float().item()
-            micro += 1
-            if acc.sync_gradients:
-                step += 1
-                if step % LOG_EVERY == 0 and acc.is_main_process:
-                    print(f"step {step} loss {running/max(micro,1):.4f} lr {sch.get_last_lr()[0]:.2e}", flush=True)
-                    running = 0.0
-                    micro = 0
-                if step >= MAX_STEPS:
-                    break
-
-    acc.wait_for_everyone()
-    if acc.is_main_process:
-        os.makedirs(OUT_DIR, exist_ok=True)
-    unwrapped = acc.unwrap_model(model)
-    state = acc.get_state_dict(model)
-    if acc.is_main_process:
-        unwrapped.save_pretrained(OUT_DIR, state_dict=state, safe_serialization=True)
-        tok.save_pretrained(OUT_DIR)
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=ds,
+        data_collator=Collator(tok, DELAY),
+    )
+    trainer.train()
+    trainer.save_model(args.output_dir)
 
 
 if __name__ == "__main__":
