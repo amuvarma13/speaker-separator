@@ -97,7 +97,9 @@ Two HF datasets (private, `InternalCan` org, gated by your `HF_TOKEN`):
 | dataset | size | when to use |
 |---|---|---|
 | `InternalCan/10k_hrs_audio_with_tokens_small_example_ds` | ~5 k rows / 4.2 GB / 2 shards | development / smoke tests |
-| `InternalCan/10k_hrs_audio_with_tokens` | ~7.9 M rows / ~7 TB / 3170 shards | full pretraining |
+| `InternalCan/10k_hrs_audio_with_tokens` | ~7.9 M rows / **~1.5 TB** / 3170 shards | full pretraining |
+
+The full training dataset is approximately **1.5 TB** on disk — comfortably within the few-TB ballpark and far below the ~369 TB free on `/workspace`.
 
 Schema per row: `audio` (raw bytes), `text`, `semantic_codes`, `cb_0..cb_6` (12.5 Hz `int32` lists), `duration`, plus metadata.
 
@@ -221,7 +223,7 @@ Loss came down from 19 → 10 in 200 bs=1 steps with everything trainable, confi
 
 `run.sh` exports `HF_HOME=/workspace/.hf_cache`, `HF_DATASETS_CACHE=/workspace/.hf_cache/datasets`, `TRANSFORMERS_CACHE=/workspace/.hf_cache/transformers` so nothing dataset- or weight-shaped lands on `/`.
 
-Per checkpoint we write the full bf16 model (~8 GB) plus optimizer state plus tokenizer. With `save_total_limit=2` the on-disk ceiling is ~60 GB per run. The full ~7 TB dataset fits on `/workspace` ~50× over.
+Per checkpoint we write the full bf16 model (~8 GB) plus optimizer state plus tokenizer. With `save_total_limit=2` the on-disk ceiling is ~60 GB per run. The full ~1.5 TB training dataset fits on `/workspace` hundreds of times over.
 
 `SAVE_STEPS=5000` is calibrated to roughly **one checkpoint every ~3 hours** at the recommended operating point (bs≈8, frozen w2v).
 
