@@ -8,8 +8,9 @@ from model import SpeakerSeparator
 
 
 SR = 16000
-LLM_NAME = os.environ.get("LLM_NAME", "Qwen/Qwen3-4B")
+LLM_NAME = os.environ.get("LLM_NAME", "InternalCan/4b-11nodes-c771-1fullepoch-0-a6c76f-2026-01-26-03-13-08")
 W2V_NAME = os.environ.get("W2V_NAME", "facebook/wav2vec2-base")
+FREEZE_W2V = int(os.environ.get("FREEZE_W2V", "1"))
 DATA_DIR = os.environ.get("DATA_DIR", "./data_internalcan")
 DELAY = int(os.environ.get("DELAY", "0"))
 BSZ = int(os.environ.get("BSZ", "1"))
@@ -21,6 +22,8 @@ SEED = int(os.environ.get("SEED", "0"))
 MAX_AUDIO_S = float(os.environ.get("MAX_AUDIO_S", "12"))
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "2"))
 LIMIT = int(os.environ.get("LIMIT", "0"))
+SAVE_STEPS = int(os.environ.get("SAVE_STEPS", "5000"))
+RUN_TAG = os.environ.get("RUN_TAG", "")
 
 TOK_LEN = 151936
 START_SPEECH = TOK_LEN + 1
@@ -121,9 +124,14 @@ def main():
     w2v_pre = Wav2Vec2Model.from_pretrained(W2V_NAME, torch_dtype=torch.bfloat16)
     model.w2v.load_state_dict(w2v_pre.state_dict())
     del w2v_pre
-    model.resize_token_embeddings(NEW_VOCAB)
+    if model.get_input_embeddings().weight.shape[0] < NEW_VOCAB:
+        model.resize_token_embeddings(NEW_VOCAB)
+    if FREEZE_W2V:
+        for p in model.w2v.parameters():
+            p.requires_grad = False
 
-    run = f"d{DELAY}_bs{BSZ}x{GA}_lr{LR:.0e}_{LLM_NAME.split('/')[-1]}"
+    tag = LLM_NAME.split("/")[-1][:24]
+    run = f"d{DELAY}_bs{BSZ}x{GA}_lr{LR:.0e}_{tag}" + (f"_{RUN_TAG}" if RUN_TAG else "")
     args = TrainingArguments(
         output_dir=f"./checkpoints/{run}",
         per_device_train_batch_size=BSZ,
@@ -132,7 +140,7 @@ def main():
         max_steps=MAX_STEPS,
         warmup_steps=WARMUP,
         logging_steps=1,
-        save_steps=1000,
+        save_steps=SAVE_STEPS,
         save_total_limit=2,
         bf16=True,
         dataloader_num_workers=NUM_WORKERS,
