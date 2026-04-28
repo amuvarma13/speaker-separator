@@ -9,6 +9,8 @@ data/
 checkpoints/
 runs/
 wandb/
+download.log
+*.log
 *.wav
 *.flac
 *.parquet
