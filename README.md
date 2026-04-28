@@ -117,13 +117,6 @@ DATA_DIR=./data_internalcan_full NUM_SHARDS=10 WORKERS=32 \
 python download_data.py
 ```
 
-The big dataset upload ETA can be polled in the background:
-
-```bash
-HF_TOKEN=... ./poll_big_dataset.sh &
-tail -f poll_big.log
-```
-
 Everything writes to `/workspace/...` so the small local `/` (~1 TB) never fills up. The shared `/workspace` mount has hundreds of TB free.
 
 ---
@@ -234,7 +227,6 @@ Per checkpoint we write the full bf16 model (~8 GB) plus optimizer state plus to
 - `model.py` — `SpeakerSeparator(Qwen3ForCausalLM)` (no comments, no docstrings, no main).
 - `train.py` — minimal HF `Trainer` + a custom collator that builds the interleaved sequence with `delay_frames`.
 - `download_data.py` — multi-thread `hf_hub_download` for any HF dataset; supports `REPO`, `NUM_SHARDS`, `WORKERS`.
-- `poll_big_dataset.sh` — appends shard count to `poll_big.log` every 10 min.
 - `run.sh` — `accelerate launch` wrapper that exports the env vars and a random `--main_process_port`.
 - `requirements.txt` — pinned versions of torch / transformers / accelerate / flash-attn / wandb / hf_xet / etc.
 
