@@ -62,21 +62,16 @@ def generate(model, tok, wav, text="", delay=2, max_audio_s=12.0, temperature=0.
     n_frames = a.shape[1]
 
     embed = model.get_input_embeddings()
-    past = None
+    embeds = embed(torch.tensor([prefix], device=device))
 
-    def fwd(new_emb):
-        nonlocal past
+    def fwd():
         out = Qwen3ForCausalLM.forward(
             model,
-            inputs_embeds=new_emb,
-            past_key_values=past,
-            use_cache=True,
+            inputs_embeds=embeds,
+            use_cache=False,
             return_dict=True,
         )
-        past = out.past_key_values
         return out.logits[0, -1].float()
-
-    last_logits = fwd(embed(torch.tensor([prefix], device=device)))
 
     schedule = []
     for t in range(n_frames + delay):
@@ -91,16 +86,16 @@ def generate(model, tok, wav, text="", delay=2, max_audio_s=12.0, temperature=0.
 
     for kind, val in schedule:
         if kind == "latent":
-            last_logits = fwd(a[:, val:val + 1])
+            embeds = torch.cat([embeds, a[:, val:val + 1]], dim=1)
         else:
             ct, i = val
+            logits = fwd()
             lo = OFFS[i] + AUDIO_START
             hi = lo + CB_SIZES[i]
-            cb_logits = last_logits[lo:hi]
-            code = sample_token(cb_logits, temperature, top_k)
+            code = sample_token(logits[lo:hi], temperature, top_k)
             predicted[ct][i] = code
             token_id = code + lo
-            last_logits = fwd(embed(torch.tensor([[token_id]], device=device)))
+            embeds = torch.cat([embeds, embed(torch.tensor([[token_id]], device=device))], dim=1)
 
     return np.asarray(predicted, dtype=np.int32)
 
