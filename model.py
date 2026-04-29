@@ -1,6 +1,18 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import Qwen3ForCausalLM, Wav2Vec2Model, Wav2Vec2Config
+
+
+class GatedMLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.linear1 = nn.Linear(input_dim, hidden_dim)
+        self.linear2 = nn.Linear(input_dim, hidden_dim)
+        self.proj = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        return self.proj(F.silu(self.linear1(x)) * self.linear2(x))
 
 
 class SpeakerSeparator(Qwen3ForCausalLM):
@@ -10,10 +22,10 @@ class SpeakerSeparator(Qwen3ForCausalLM):
         w2v_cfg = Wav2Vec2Config.from_pretrained(w2v_name)
         w2v_cfg.gradient_checkpointing = False
         self.w2v = Wav2Vec2Model(w2v_cfg)
-        self.proj = nn.Sequential(
-            nn.Linear(w2v_cfg.hidden_size * down, config.hidden_size),
-            nn.GELU(),
-            nn.Linear(config.hidden_size, config.hidden_size),
+        self.proj = GatedMLP(
+            input_dim=w2v_cfg.hidden_size * down,
+            hidden_dim=4096,
+            output_dim=config.hidden_size,
         )
 
     def encode_audio(self, audio):

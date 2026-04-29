@@ -12,7 +12,7 @@ LLM_NAME = os.environ.get("LLM_NAME", "InternalCan/4b-11nodes-c771-1fullepoch-0-
 TOK_NAME = os.environ.get("TOK_NAME", LLM_NAME)
 W2V_NAME = os.environ.get("W2V_NAME", "facebook/wav2vec2-base")
 FREEZE_W2V = int(os.environ.get("FREEZE_W2V", "1"))
-DATA_DIR = os.environ.get("DATA_DIR", "./data_internalcan")
+DATA_DIR = os.environ.get("DATA_DIR", "./data_smoke")
 DELAY = int(os.environ.get("DELAY", "0"))
 BSZ = int(os.environ.get("BSZ", "1"))
 GA = int(os.environ.get("GA", "8"))
@@ -48,6 +48,18 @@ def shards():
     return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".parquet"))
 
 
+class PairDataset(torch.utils.data.Dataset):
+    def __init__(self, ds):
+        self.ds = ds
+        self.half = len(ds) // 2
+
+    def __len__(self):
+        return self.half
+
+    def __getitem__(self, idx):
+        return (self.ds[idx], self.ds[idx + self.half])
+
+
 class Collator:
     def __init__(self, tok, delay):
         self.tok = tok
@@ -55,15 +67,21 @@ class Collator:
 
     def __call__(self, batch):
         audios, idses, masks, labelses = [], [], [], []
-        for r in batch:
-            wav = np.asarray(r["audio"]["array"], dtype=np.float32)
+        for r1, r2 in batch:
+            wav1 = np.asarray(r1["audio"]["array"], dtype=np.float32)
+            wav2 = np.asarray(r2["audio"]["array"], dtype=np.float32)
             n_max = int(MAX_AUDIO_S * SR)
-            if wav.shape[0] > n_max:
-                wav = wav[:n_max]
-            n_w2v = (wav.shape[0] // 320) // 4
-            n_codes = min(len(r["semantic_codes"]), n_w2v)
-            text_ids = self.tok.encode(r["text"], add_special_tokens=False)
-            prefix = [START_HUMAN, START_TEXT, *text_ids, END_TEXT, END_HUMAN, START_AI, START_SPEECH]
+            if wav1.shape[0] > n_max:
+                wav1 = wav1[:n_max]
+            if wav2.shape[0] > n_max:
+                wav2 = wav2[:n_max]
+            n = max(wav1.shape[0], wav2.shape[0])
+            mix = np.zeros(n, dtype=np.float32)
+            mix[:wav1.shape[0]] += wav1
+            mix[:wav2.shape[0]] += wav2
+            n_w2v = (mix.shape[0] // 320) // 4
+            n_codes = min(len(r1["semantic_codes"]), len(r2["semantic_codes"]), n_w2v)
+            prefix = [START_HUMAN, START_TEXT, END_TEXT, END_HUMAN, START_AI, START_SPEECH]
             seq = list(prefix)
             mask = [False] * len(prefix)
             for t in range(n_codes + self.delay):
@@ -72,16 +90,17 @@ class Collator:
                     mask.append(True)
                 ct = t - self.delay
                 if 0 <= ct < n_codes:
-                    for i, name in enumerate(CB):
-                        c = r[name][ct]
-                        if c == -1:
-                            continue
-                        seq.append(c + OFFS[i] + AUDIO_START)
-                        mask.append(False)
+                    for r in (r1, r2):
+                        for i, name in enumerate(CB):
+                            c = r[name][ct]
+                            if c == -1:
+                                continue
+                            seq.append(c + OFFS[i] + AUDIO_START)
+                            mask.append(False)
             seq.extend([END_SPEECH, END_AI])
             mask.extend([False, False])
             lbl = [-100 if m else s for s, m in zip(seq, mask)]
-            audios.append(wav)
+            audios.append(mix)
             idses.append(seq)
             masks.append(mask)
             labelses.append(lbl)
@@ -118,6 +137,7 @@ def main():
     if LIMIT > 0:
         ds = ds.select(range(min(LIMIT, len(ds))))
     ds = ds.cast_column("audio", Audio(sampling_rate=SR))
+    ds = PairDataset(ds)
 
     model = SpeakerSeparator.from_pretrained(
         LLM_NAME,
@@ -135,7 +155,7 @@ def main():
             p.requires_grad = False
 
     tag = LLM_NAME.split("/")[-1][:24]
-    run = f"d{DELAY}_bs{BSZ}x{GA}_lr{LR:.0e}_{tag}" + (f"_{RUN_TAG}" if RUN_TAG else "")
+    run = f"sep_d{DELAY}_bs{BSZ}x{GA}_lr{LR:.0e}_{tag}" + (f"_{RUN_TAG}" if RUN_TAG else "")
     args = TrainingArguments(
         output_dir=f"./checkpoints/{run}",
         per_device_train_batch_size=BSZ,

@@ -11,9 +11,14 @@ runs/
 wandb/
 download.log
 *.log
+*.log.prev*
 data_internalcan/
 data_internalcan_full/
+data_smoke/
 smoke.log
+AGENT_*.md
+STATUS_FOR_USER.md
+.agent_prompt.txt
 *.wav
 *.flac
 *.parquet
