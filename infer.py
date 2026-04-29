@@ -49,19 +49,17 @@ def sample_token(logits, temperature, top_k):
 
 
 @torch.no_grad()
-def generate(model, tok, wav, text="", delay=2, max_audio_s=12.0, sil_pad_s=0.5, temperature=0.0, top_k=0, device="cuda"):
+def generate(model, tok, wav, text="", delay=2, max_audio_s=12.0, temperature=0.0, top_k=0, device="cuda"):
     text_ids = tok.encode(text, add_special_tokens=False) if text else []
     prefix = [START_HUMAN, START_TEXT, *text_ids, END_TEXT, END_HUMAN, START_AI, START_SPEECH]
 
     n_max = int(max_audio_s * SR)
     if wav.shape[0] > n_max:
         wav = wav[:n_max]
-    wav = np.concatenate([np.asarray(wav, dtype=np.float32), np.zeros(int(sil_pad_s * SR), dtype=np.float32)])
-    audio = torch.from_numpy(wav).to(torch.bfloat16).unsqueeze(0).to(device)
+    audio = torch.from_numpy(np.asarray(wav, dtype=np.float32)).to(torch.bfloat16).unsqueeze(0).to(device)
 
     a = model.encode_audio(audio)
-    n_w2v = a.shape[1]
-    n_frames = max(0, n_w2v - delay)
+    n_frames = a.shape[1]
 
     embed = model.get_input_embeddings()
     embeds = embed(torch.tensor([prefix], device=device))
@@ -77,7 +75,8 @@ def generate(model, tok, wav, text="", delay=2, max_audio_s=12.0, sil_pad_s=0.5,
 
     schedule = []
     for t in range(n_frames + delay):
-        schedule.append(("latent", t))
+        if 0 <= t < n_frames:
+            schedule.append(("latent", t))
         ct = t - delay
         if 0 <= ct < n_frames:
             for i in range(len(CB_SIZES)):
@@ -109,7 +108,6 @@ def main():
     ap.add_argument("--w2v", default="facebook/wav2vec2-base")
     ap.add_argument("--tok", default=None)
     ap.add_argument("--max_audio_s", type=float, default=12.0)
-    ap.add_argument("--sil_pad_s", type=float, default=0.5)
     ap.add_argument("--delay", type=int, default=2)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top_k", type=int, default=0)
@@ -138,7 +136,6 @@ def main():
         text=args.text,
         delay=args.delay,
         max_audio_s=args.max_audio_s,
-        sil_pad_s=args.sil_pad_s,
         temperature=args.temperature,
         top_k=args.top_k,
         device=args.device,

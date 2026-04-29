@@ -21,7 +21,6 @@ MAX_STEPS = int(os.environ.get("MAX_STEPS", "5000"))
 WARMUP = int(os.environ.get("WARMUP", "100"))
 SEED = int(os.environ.get("SEED", "0"))
 MAX_AUDIO_S = float(os.environ.get("MAX_AUDIO_S", "12"))
-SIL_PAD_S = float(os.environ.get("SIL_PAD_S", "0.5"))
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "2"))
 LIMIT = int(os.environ.get("LIMIT", "0"))
 SAVE_STEPS = int(os.environ.get("SAVE_STEPS", "5000"))
@@ -56,22 +55,21 @@ class Collator:
 
     def __call__(self, batch):
         audios, idses, masks, labelses = [], [], [], []
-        sil = int(SIL_PAD_S * SR)
         for r in batch:
             wav = np.asarray(r["audio"]["array"], dtype=np.float32)
             n_max = int(MAX_AUDIO_S * SR)
             if wav.shape[0] > n_max:
                 wav = wav[:n_max]
-            wav = np.concatenate([wav, np.zeros(sil, dtype=np.float32)])
             n_w2v = (wav.shape[0] // 320) // 4
-            n_codes = min(len(r["semantic_codes"]), n_w2v - self.delay)
+            n_codes = min(len(r["semantic_codes"]), n_w2v)
             text_ids = self.tok.encode(r["text"], add_special_tokens=False)
             prefix = [START_HUMAN, START_TEXT, *text_ids, END_TEXT, END_HUMAN, START_AI, START_SPEECH]
             seq = list(prefix)
             mask = [False] * len(prefix)
             for t in range(n_codes + self.delay):
-                seq.append(PAD)
-                mask.append(True)
+                if 0 <= t < n_codes:
+                    seq.append(PAD)
+                    mask.append(True)
                 ct = t - self.delay
                 if 0 <= ct < n_codes:
                     for i, name in enumerate(CB):
